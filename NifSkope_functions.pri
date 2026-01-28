@@ -158,7 +158,7 @@ defineReplace(QtHex) {
 # Format string for Qt DLL
 
 DLLSTRING = $$quote(Qt5%1)
-CONFIG(debug, debug|release) {
+CONFIG(debug, debug|release):!*-g++ {
 	DLLEXT = $$quote(d.dll)
 } else {
 	DLLEXT = $$quote(.dll)
@@ -259,9 +259,8 @@ defineTest(copyDirs) {
 
 		# Fix copy for subdir on unix, also assure clean subdirs (no extra files)
 		!isEmpty(subdir) {
-			win32:*msvc*:QMAKE_POST_LINK += rd /s /q $${ddir} $$nt
-			else:!unix:QMAKE_POST_LINK += rm -rf $${ddir} $$nt
-			unix:QMAKE_POST_LINK += rm -rf $${ddir} $$nt
+			win32:QMAKE_POST_LINK += (if exist $${ddir} rd /s /q $${ddir}) $$nt
+			else:QMAKE_POST_LINK += rm -rf $${ddir} $$nt
 		}
 
 		QMAKE_POST_LINK += $$QMAKE_COPY_DIR $${dirabs} $${ddir} $$nt
