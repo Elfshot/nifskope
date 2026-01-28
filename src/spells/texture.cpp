@@ -13,11 +13,16 @@
 #include <QCheckBox>
 #include <QColorDialog>
 #include <QComboBox>
+#include <QDir>
+#include <QFile>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QGridLayout>
 #include <QLabel>
 #include <QListView>
 #include <QPushButton>
+#include <QQueue>
+#include <QSet>
 #include <QSettings>
 #include <QStringListModel>
 
@@ -1248,3 +1253,371 @@ public:
 };
 
 REGISTER_SPELL( spTextureFlipper )
+
+//! Helper function to find textures in a block
+static void findTexturesInBlock( const NifModel * nif, const QModelIndex & iBlock, QSet<QModelIndex> & foundTextures )
+{
+	if ( !nif || !iBlock.isValid() )
+		return;
+
+	// Check if block is directly a NiSourceTexture
+	if ( nif->isNiBlock( iBlock, "NiSourceTexture" ) ) {
+		foundTextures.insert( iBlock );
+	}
+
+	// Check Properties array
+	QModelIndex iProperties = nif->getIndex( iBlock, "Properties" );
+	if ( iProperties.isValid() ) {
+		for ( int p = 0; p < nif->rowCount( iProperties ); p++ ) {
+			qint32 propLink = nif->getLink( iProperties.child( p, 0 ) );
+			if ( propLink < 0 )
+				continue;
+
+			QModelIndex iProp = nif->getBlock( propLink );
+
+			if ( !iProp.isValid() )
+				continue;
+
+			// NiTexturingProperty
+			if ( nif->isNiBlock( iProp, "NiTexturingProperty" ) ) {
+				static const char * texnames[] = {
+					"Base Texture", "Dark Texture", "Detail Texture", "Gloss Texture",
+					"Glow Texture", "Bump Map Texture", "Decal 0 Texture", "Decal 1 Texture",
+					"Decal 2 Texture", "Decal 3 Texture"
+				};
+
+				for ( const char * texname : texnames ) {
+					QModelIndex iTex = nif->getIndex( iProp, texname );
+					if ( iTex.isValid() ) {
+						qint32 sourceLink = nif->getLink( iTex, "Source" );
+						if ( sourceLink >= 0 ) {
+							QModelIndex iSource = nif->getBlock( sourceLink, "NiSourceTexture" );
+							if ( iSource.isValid() ) {
+								foundTextures.insert( iSource );
+							}
+						}
+					}
+				}
+			}
+			// BSShaderPPLightingProperty / BSLightingShaderProperty
+			else if ( nif->isNiBlock( iProp, "BSShaderPPLightingProperty" ) || nif->isNiBlock( iProp, "BSLightingShaderProperty" ) ) {
+				qint32 texSetLink = nif->getLink( iProp, "Texture Set" );
+				if ( texSetLink >= 0 ) {
+					QModelIndex iTexSet = nif->getBlock( texSetLink, "BSShaderTextureSet" );
+					if ( iTexSet.isValid() ) {
+						// BSShaderTextureSet contains string paths, not NiSourceTexture blocks
+						// We'll handle these separately in the export logic
+						foundTextures.insert( iTexSet );
+					}
+				}
+			}
+			// BSEffectShaderProperty
+			else if ( nif->isNiBlock( iProp, "BSEffectShaderProperty" ) ) {
+				// BSEffectShaderProperty has string paths, not NiSourceTexture blocks
+				// We'll handle these separately in the export logic
+				foundTextures.insert( iProp );
+			}
+			// NiTextureProperty (older format)
+			else if ( nif->isNiBlock( iProp, "NiTextureProperty" ) ) {
+				qint32 imageLink = nif->getLink( iProp, "Image" );
+				if ( imageLink >= 0 ) {
+					QModelIndex iImage = nif->getBlock( imageLink, "NiImage" );
+					if ( iImage.isValid() ) {
+						foundTextures.insert( iImage );
+					}
+				}
+			}
+		}
+	}
+}
+
+//! Helper function to extract texture name from various sources
+static QString extractTextureName( const NifModel * nif, const QModelIndex & iTexture, int blockNum )
+{
+	if ( !nif || !iTexture.isValid() )
+		return QString();
+
+	// NiSourceTexture
+	if ( nif->isNiBlock( iTexture, "NiSourceTexture" ) ) {
+		int useExternal = nif->get<int>( iTexture, "Use External" );
+		if ( useExternal == 0 ) {
+			// Embedded texture - use block number
+			return QString( "texture_%1" ).arg( blockNum );
+		} else {
+			// External texture - extract filename
+			QString fileName = nif->get<QString>( iTexture, "File Name" );
+			QFileInfo fileInfo( fileName );
+			QString baseName = fileInfo.completeBaseName();
+			if ( baseName.isEmpty() ) {
+				return QString( "texture_%1" ).arg( blockNum );
+			}
+			return baseName;
+		}
+	}
+	// BSShaderTextureSet - use block number
+	else if ( nif->isNiBlock( iTexture, "BSShaderTextureSet" ) ) {
+		return QString( "textureset_%1" ).arg( blockNum );
+	}
+	// BSEffectShaderProperty - extract from source texture path
+	else if ( nif->isNiBlock( iTexture, "BSEffectShaderProperty" ) ) {
+		QString sourceTex = nif->get<QString>( iTexture, "Source Texture" );
+		if ( !sourceTex.isEmpty() ) {
+			QFileInfo fileInfo( sourceTex );
+			QString baseName = fileInfo.completeBaseName();
+			if ( !baseName.isEmpty() ) {
+				return baseName;
+			}
+		}
+		return QString( "effectshader_%1" ).arg( blockNum );
+	}
+	// NiImage
+	else if ( nif->isNiBlock( iTexture, "NiImage" ) ) {
+		QString fileName = nif->get<QString>( iTexture, "File Name" );
+		if ( !fileName.isEmpty() ) {
+			QFileInfo fileInfo( fileName );
+			QString baseName = fileInfo.completeBaseName();
+			if ( !baseName.isEmpty() ) {
+				return baseName;
+			}
+		}
+		return QString( "image_%1" ).arg( blockNum );
+	}
+
+	return QString( "texture_%1" ).arg( blockNum );
+}
+
+//! Export all textures from the scene
+class spExportAllTextures final : public Spell
+{
+public:
+	QString name() const override final { return Spell::tr( "Export All Textures" ); }
+	QString page() const override final { return Spell::tr( "Texture" ); }
+	bool batch() const override final { return true; }
+
+	bool isApplicable( const NifModel * nif, const QModelIndex & index ) override final
+	{
+		Q_UNUSED( index );
+		return nif != nullptr && nif->getBlockCount() > 0;
+	}
+
+	QModelIndex cast( NifModel * nif, const QModelIndex & index ) override final
+	{
+		Q_UNUSED( index );
+
+		if ( !nif || nif->getBlockCount() == 0 )
+			return QModelIndex();
+
+		// BFS traversal to find all textures
+		QQueue<int> queue;
+		QSet<int> visited;
+		QSet<QModelIndex> foundTextures;
+
+		// Start with root nodes
+		for ( const auto rootLink : nif->getRootLinks() ) {
+			queue.enqueue( rootLink );
+			visited.insert( rootLink );
+		}
+
+		// BFS traversal
+		while ( !queue.isEmpty() ) {
+			int currentBlock = queue.dequeue();
+			QModelIndex iBlock = nif->getBlock( currentBlock );
+
+			if ( iBlock.isValid() ) {
+				// Find textures in this block
+				findTexturesInBlock( nif, iBlock, foundTextures );
+
+				// Add children to queue
+				for ( const auto childLink : nif->getChildLinks( currentBlock ) ) {
+					if ( !visited.contains( childLink ) ) {
+						visited.insert( childLink );
+						queue.enqueue( childLink );
+					}
+				}
+			}
+		}
+
+		if ( foundTextures.isEmpty() ) {
+			Message::info( nullptr, Spell::tr( "Export All Textures" ),
+				Spell::tr( "No textures found in the scene." )
+			);
+			return QModelIndex();
+		}
+
+		// Determine export directory
+		QString nifFileName = nif->getFilename();
+		QFileInfo fileInfo( nifFileName );
+		QString baseName = fileInfo.completeBaseName();
+		if ( baseName.isEmpty() ) {
+			baseName = "untitled";
+		}
+
+		QString nifFolder = nif->getFolder();
+		QString exportDir = QDir( nifFolder ).filePath( baseName + "_textures" );
+
+		// Create directory if it doesn't exist
+		QDir dir;
+		if ( !dir.mkpath( exportDir ) ) {
+			Message::warning( nullptr, Spell::tr( "Export All Textures" ),
+				Spell::tr( "Failed to create export directory: %1" ).arg( exportDir )
+			);
+			return QModelIndex();
+		}
+
+		// Export textures
+		TexCache tex;
+		tex.setNifFolder( nifFolder );
+
+		QSet<QString> exportedNames;
+		int exportedCount = 0;
+		int failedCount = 0;
+
+		for ( const QModelIndex & iTexture : foundTextures ) {
+			if ( !iTexture.isValid() )
+				continue;
+
+			int blockNum = nif->getBlockNumber( iTexture );
+
+			// Handle NiSourceTexture (embedded or external)
+			if ( nif->isNiBlock( iTexture, "NiSourceTexture" ) ) {
+				int useExternal = nif->get<int>( iTexture, "Use External" );
+				QString textureName = extractTextureName( nif, iTexture, blockNum );
+
+				if ( useExternal == 0 ) {
+					// Embedded texture - export pixel data
+					QModelIndex iPixelData = nif->getBlock( nif->getLink( iTexture, "Pixel Data" ) );
+					if ( iPixelData.isValid() ) {
+						QString exportPath = getUniquePath( exportDir, textureName, ".dds", exportedNames );
+						QString filepath = exportPath;
+						if ( tex.exportFile( iPixelData, filepath ) ) {
+							exportedCount++;
+						} else {
+							failedCount++;
+						}
+					}
+				} else {
+					// External texture - find and copy file
+					QString fileName = nif->get<QString>( iTexture, "File Name" );
+					if ( !fileName.isEmpty() ) {
+						QString foundPath = TexCache::find( fileName, nifFolder );
+						if ( !foundPath.isEmpty() && QFile::exists( foundPath ) ) {
+							QString exportPath = getUniquePath( exportDir, textureName, ".dds", exportedNames );
+							if ( QFile::copy( foundPath, exportPath ) ) {
+								exportedCount++;
+							} else {
+								failedCount++;
+							}
+						} else {
+							failedCount++;
+						}
+					}
+				}
+			}
+			// Handle BSShaderTextureSet - export all texture strings
+			else if ( nif->isNiBlock( iTexture, "BSShaderTextureSet" ) ) {
+				QModelIndex iTextures = nif->getIndex( iTexture, "Textures" );
+				if ( iTextures.isValid() ) {
+					int numTextures = nif->get<int>( iTexture, "Num Textures" );
+					for ( int t = 0; t < numTextures && t < nif->rowCount( iTextures ); t++ ) {
+						QString texPath = nif->get<QString>( iTextures.child( t, 0 ) );
+						if ( !texPath.isEmpty() ) {
+							QString foundPath = TexCache::find( texPath, nifFolder );
+							if ( !foundPath.isEmpty() && QFile::exists( foundPath ) ) {
+								QFileInfo texInfo( texPath );
+								QString textureName = texInfo.completeBaseName();
+								if ( textureName.isEmpty() ) {
+									textureName = QString( "textureset_%1_tex_%2" ).arg( blockNum ).arg( t );
+								}
+								QString exportPath = getUniquePath( exportDir, textureName, ".dds", exportedNames );
+								if ( QFile::copy( foundPath, exportPath ) ) {
+									exportedCount++;
+								} else {
+									failedCount++;
+								}
+							} else {
+								failedCount++;
+							}
+						}
+					}
+				}
+			}
+			// Handle BSEffectShaderProperty - export texture strings
+			else if ( nif->isNiBlock( iTexture, "BSEffectShaderProperty" ) ) {
+				QStringList textureFields = {
+					"Source Texture", "Greyscale Texture", "Env Map Texture",
+					"Normal Texture", "Env Mask Texture"
+				};
+
+				for ( const QString & field : textureFields ) {
+					QString texPath = nif->get<QString>( iTexture, field );
+					if ( !texPath.isEmpty() ) {
+						QString foundPath = TexCache::find( texPath, nifFolder );
+						if ( !foundPath.isEmpty() && QFile::exists( foundPath ) ) {
+							QFileInfo texInfo( texPath );
+							QString textureName = texInfo.completeBaseName();
+							if ( textureName.isEmpty() ) {
+								textureName = QString( "effectshader_%1_%2" ).arg( blockNum ).arg( field.toLower().replace( " ", "_" ) );
+							}
+							QString exportPath = getUniquePath( exportDir, textureName, ".dds", exportedNames );
+							if ( QFile::copy( foundPath, exportPath ) ) {
+								exportedCount++;
+							} else {
+								failedCount++;
+							}
+						} else {
+							failedCount++;
+						}
+					}
+				}
+			}
+			// Handle NiImage
+			else if ( nif->isNiBlock( iTexture, "NiImage" ) ) {
+				QString fileName = nif->get<QString>( iTexture, "File Name" );
+				if ( !fileName.isEmpty() ) {
+					QString foundPath = TexCache::find( fileName, nifFolder );
+					if ( !foundPath.isEmpty() && QFile::exists( foundPath ) ) {
+						QString textureName = extractTextureName( nif, iTexture, blockNum );
+						QString exportPath = getUniquePath( exportDir, textureName, ".dds", exportedNames );
+						if ( QFile::copy( foundPath, exportPath ) ) {
+							exportedCount++;
+						} else {
+							failedCount++;
+						}
+					} else {
+						failedCount++;
+					}
+				}
+			}
+		}
+
+		// Show results
+		QString message = Spell::tr( "Exported %1 texture(s) to %2" ).arg( exportedCount ).arg( exportDir );
+		if ( failedCount > 0 ) {
+			message += "\n" + Spell::tr( "Failed to export %1 texture(s)" ).arg( failedCount );
+			Message::warning( nullptr, Spell::tr( "Export All Textures" ), message );
+		} else {
+			Message::info( nullptr, Spell::tr( "Export All Textures" ), message );
+		}
+
+		return QModelIndex();
+	}
+
+private:
+	//! Get a unique file path, appending _1, _2, etc. if needed
+	static QString getUniquePath( const QString & dir, const QString & baseName, const QString & extension, QSet<QString> & usedNames )
+	{
+		QString fullPath = QDir( dir ).filePath( baseName + extension );
+		QString uniquePath = fullPath;
+		int counter = 1;
+
+		while ( usedNames.contains( uniquePath ) || QFile::exists( uniquePath ) ) {
+			uniquePath = QDir( dir ).filePath( QString( "%1_%2%3" ).arg( baseName ).arg( counter ).arg( extension ) );
+			counter++;
+		}
+
+		usedNames.insert( uniquePath );
+		return uniquePath;
+	}
+};
+
+REGISTER_SPELL( spExportAllTextures )
