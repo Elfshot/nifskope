@@ -1,7 +1,7 @@
 ###############################
 ## TARGETS
 ###############################
-# Note: dir or file in build dir cannot be named the same as the target
+# Note: dir or file in build dir cannot be named the same as the target bonk
 # e.g. "docs" target will fail if a "docs" folder is in OUT_PWD
 
 win32:EXE = ".exe"
