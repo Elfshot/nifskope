@@ -14,7 +14,7 @@ matrix:
 os: Visual Studio 2015
 
 # We want the git revision for versioning,
-# so shallow clones don't work.
+# so shallow clones don't work. vroom
 clone_depth: 1
 
 clone_folder: C:\projects\nifskope
