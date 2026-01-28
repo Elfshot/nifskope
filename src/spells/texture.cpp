@@ -2,6 +2,7 @@
 
 #include "spellbook.h"
 #include "gl/gltex.h"
+#include "gl/gltexloaders.h"
 #include "spells/blocks.h"
 #include "ui/widgets/fileselect.h"
 #include "ui/widgets/nifeditors.h"
@@ -1265,6 +1266,12 @@ static void findTexturesInBlock( const NifModel * nif, const QModelIndex & iBloc
 		foundTextures.insert( iBlock );
 	}
 
+	// Check if block is directly a NiPixelData (standalone texture data)
+	QString blockName = nif->getBlockName( iBlock );
+	if ( blockName == "NiPixelData" || nif->inherits( iBlock, "NiPixelData" ) ) {
+		foundTextures.insert( iBlock );
+	}
+
 	// Check Properties array
 	QModelIndex iProperties = nif->getIndex( iBlock, "Properties" );
 	if ( iProperties.isValid() ) {
@@ -1354,6 +1361,10 @@ static QString extractTextureName( const NifModel * nif, const QModelIndex & iTe
 			return baseName;
 		}
 	}
+	// NiPixelData - use block number
+	else if ( nif->getBlockName( iTexture ) == "NiPixelData" || nif->inherits( iTexture, "NiPixelData" ) ) {
+		return QString( "pixeldata_%1" ).arg( blockNum );
+	}
 	// BSShaderTextureSet - use block number
 	else if ( nif->isNiBlock( iTexture, "BSShaderTextureSet" ) ) {
 		return QString( "textureset_%1" ).arg( blockNum );
@@ -1386,6 +1397,41 @@ static QString extractTextureName( const NifModel * nif, const QModelIndex & iTe
 	return QString( "texture_%1" ).arg( blockNum );
 }
 
+//! Helper function to export NiPixelData from .nif/.texcache to DDS
+static bool exportPixelDataFromNifFile( const QString & inputPath, const QString & outputPath )
+{
+	QFile file( inputPath );
+	if ( !file.open( QIODevice::ReadOnly ) )
+		return false;
+
+	NifModel pix;
+	if ( !pix.load( file ) )
+		return false;
+
+	for ( const auto rootLink : pix.getRootLinks() ) {
+		QModelIndex iData = pix.getBlock( rootLink, "NiPixelFormat" );
+		if ( !iData.isValid() )
+			continue;
+
+		GLuint mipmaps = pix.get<uint>( iData, "Num Mipmaps" );
+		QModelIndex iMipmaps = pix.getIndex( iData, "Mipmaps" );
+		GLuint width = 0;
+		GLuint height = 0;
+
+		if ( mipmaps > 0 && iMipmaps.isValid() ) {
+			QModelIndex iMipmap = iMipmaps.child( 0, 0 );
+			width  = pix.get<uint>( iMipmap, "Width" );
+			height = pix.get<uint>( iMipmap, "Height" );
+		}
+
+		if ( width > 0 && height > 0 ) {
+			return texSaveDDS( iData, outputPath, width, height, mipmaps );
+		}
+	}
+
+	return false;
+}
+
 //! Export all textures from the scene
 class spExportAllTextures final : public Spell
 {
@@ -1396,8 +1442,7 @@ public:
 
 	bool isApplicable( const NifModel * nif, const QModelIndex & index ) override final
 	{
-		Q_UNUSED( index );
-		return nif != nullptr && nif->getBlockCount() > 0;
+		return nif && !index.isValid();
 	}
 
 	QModelIndex cast( NifModel * nif, const QModelIndex & index ) override final
@@ -1465,8 +1510,8 @@ public:
 		}
 
 		// Export textures
-		TexCache tex;
-		tex.setNifFolder( nifFolder );
+		// Create a fresh TexCache for each texture export to match spExportTexture behavior
+		// This ensures clean state for each export and avoids corruption
 
 		QSet<QString> exportedNames;
 		int exportedCount = 0;
@@ -1484,25 +1529,26 @@ public:
 				QString textureName = extractTextureName( nif, iTexture, blockNum );
 
 				if ( useExternal == 0 ) {
-					// Embedded texture - export pixel data
+					// Embedded texture - use texSaveDDS directly to avoid OpenGL state issues
+					// This matches the approach but reads directly from NIF model
 					QModelIndex iPixelData = nif->getBlock( nif->getLink( iTexture, "Pixel Data" ) );
 					if ( iPixelData.isValid() ) {
-						QString exportPath = getUniquePath( exportDir, textureName, ".dds", exportedNames );
-						QString filepath = exportPath;
-						if ( tex.exportFile( iPixelData, filepath ) ) {
-							exportedCount++;
-						} else {
-							failedCount++;
+						// Get texture dimensions from NIF model
+						GLuint mipmaps = nif->get<uint>( iPixelData, "Num Mipmaps" );
+						QModelIndex iMipmaps = nif->getIndex( iPixelData, "Mipmaps" );
+						GLuint width = 0;
+						GLuint height = 0;
+						
+						if ( mipmaps > 0 && iMipmaps.isValid() ) {
+							QModelIndex iMipmap = iMipmaps.child( 0, 0 );
+							width  = nif->get<uint>( iMipmap, "Width" );
+							height = nif->get<uint>( iMipmap, "Height" );
 						}
-					}
-				} else {
-					// External texture - find and copy file
-					QString fileName = nif->get<QString>( iTexture, "File Name" );
-					if ( !fileName.isEmpty() ) {
-						QString foundPath = TexCache::find( fileName, nifFolder );
-						if ( !foundPath.isEmpty() && QFile::exists( foundPath ) ) {
+						
+						if ( width > 0 && height > 0 ) {
 							QString exportPath = getUniquePath( exportDir, textureName, ".dds", exportedNames );
-							if ( QFile::copy( foundPath, exportPath ) ) {
+							// Call texSaveDDS directly - it reads from NIF model, no OpenGL involved
+							if ( texSaveDDS( iPixelData, exportPath, width, height, mipmaps ) ) {
 								exportedCount++;
 							} else {
 								failedCount++;
@@ -1510,7 +1556,77 @@ public:
 						} else {
 							failedCount++;
 						}
+					} else {
+						failedCount++;
 					}
+				} else {
+					// External texture - find and copy file
+					QString fileName = nif->get<QString>( iTexture, "File Name" );
+					if ( !fileName.isEmpty() ) {
+						QString foundPath = TexCache::find( fileName, nifFolder );
+						if ( !foundPath.isEmpty() && QFile::exists( foundPath ) ) {
+							QFileInfo foundInfo( foundPath );
+							QString extension = foundInfo.suffix();
+							if ( extension.isEmpty() )
+								extension = "dds";
+
+							if ( extension.compare( "nif", Qt::CaseInsensitive ) == 0
+								|| extension.compare( "texcache", Qt::CaseInsensitive ) == 0 )
+							{
+								QString exportPath = getUniquePath( exportDir, textureName, ".dds", exportedNames );
+								if ( exportPixelDataFromNifFile( foundPath, exportPath ) ) {
+									exportedCount++;
+								} else {
+									failedCount++;
+								}
+							} else {
+								QString exportPath = getUniquePath( exportDir, textureName, "." + extension, exportedNames );
+								if ( QFile::copy( foundPath, exportPath ) ) {
+									exportedCount++;
+								} else {
+									failedCount++;
+								}
+							}
+						} else {
+							failedCount++;
+						}
+					}
+				}
+			}
+			// Handle standalone NiPixelData blocks
+			else if ( nif->getBlockName( iTexture ) == "NiPixelData" || nif->inherits( iTexture, "NiPixelData" ) ) {
+				// If there's only one texture and it's a standalone NiPixelData, use the NIF filename
+				QString textureName;
+				if ( foundTextures.size() == 1 ) {
+					// Single texture - use NIF filename
+					textureName = baseName;
+				} else {
+					// Multiple textures - use block number
+					textureName = extractTextureName( nif, iTexture, blockNum );
+				}
+				
+				// Get texture dimensions from NIF model
+				GLuint mipmaps = nif->get<uint>( iTexture, "Num Mipmaps" );
+				QModelIndex iMipmaps = nif->getIndex( iTexture, "Mipmaps" );
+				GLuint width = 0;
+				GLuint height = 0;
+				
+				if ( mipmaps > 0 && iMipmaps.isValid() ) {
+					QModelIndex iMipmap = iMipmaps.child( 0, 0 );
+					width  = nif->get<uint>( iMipmap, "Width" );
+					height = nif->get<uint>( iMipmap, "Height" );
+				}
+				
+				if ( width > 0 && height > 0 ) {
+					QString exportPath = getUniquePath( exportDir, textureName, ".dds", exportedNames );
+					// Call texSaveDDS directly - it reads from NIF model, no OpenGL involved
+					if ( texSaveDDS( iTexture, exportPath, width, height, mipmaps ) ) {
+						exportedCount++;
+					} else {
+						failedCount++;
+					}
+				} else {
+					failedCount++;
 				}
 			}
 			// Handle BSShaderTextureSet - export all texture strings
@@ -1528,12 +1644,28 @@ public:
 								if ( textureName.isEmpty() ) {
 									textureName = QString( "textureset_%1_tex_%2" ).arg( blockNum ).arg( t );
 								}
+								QFileInfo foundInfo( foundPath );
+							QString extension = foundInfo.suffix();
+							if ( extension.isEmpty() )
+								extension = "dds";
+
+							if ( extension.compare( "nif", Qt::CaseInsensitive ) == 0
+								|| extension.compare( "texcache", Qt::CaseInsensitive ) == 0 )
+							{
 								QString exportPath = getUniquePath( exportDir, textureName, ".dds", exportedNames );
+								if ( exportPixelDataFromNifFile( foundPath, exportPath ) ) {
+									exportedCount++;
+								} else {
+									failedCount++;
+								}
+							} else {
+								QString exportPath = getUniquePath( exportDir, textureName, "." + extension, exportedNames );
 								if ( QFile::copy( foundPath, exportPath ) ) {
 									exportedCount++;
 								} else {
 									failedCount++;
 								}
+							}
 							} else {
 								failedCount++;
 							}
@@ -1558,11 +1690,27 @@ public:
 							if ( textureName.isEmpty() ) {
 								textureName = QString( "effectshader_%1_%2" ).arg( blockNum ).arg( field.toLower().replace( " ", "_" ) );
 							}
-							QString exportPath = getUniquePath( exportDir, textureName, ".dds", exportedNames );
-							if ( QFile::copy( foundPath, exportPath ) ) {
-								exportedCount++;
+							QFileInfo foundInfo( foundPath );
+							QString extension = foundInfo.suffix();
+							if ( extension.isEmpty() )
+								extension = "dds";
+
+							if ( extension.compare( "nif", Qt::CaseInsensitive ) == 0
+								|| extension.compare( "texcache", Qt::CaseInsensitive ) == 0 )
+							{
+								QString exportPath = getUniquePath( exportDir, textureName, ".dds", exportedNames );
+								if ( exportPixelDataFromNifFile( foundPath, exportPath ) ) {
+									exportedCount++;
+								} else {
+									failedCount++;
+								}
 							} else {
-								failedCount++;
+								QString exportPath = getUniquePath( exportDir, textureName, "." + extension, exportedNames );
+								if ( QFile::copy( foundPath, exportPath ) ) {
+									exportedCount++;
+								} else {
+									failedCount++;
+								}
 							}
 						} else {
 							failedCount++;
@@ -1577,11 +1725,27 @@ public:
 					QString foundPath = TexCache::find( fileName, nifFolder );
 					if ( !foundPath.isEmpty() && QFile::exists( foundPath ) ) {
 						QString textureName = extractTextureName( nif, iTexture, blockNum );
-						QString exportPath = getUniquePath( exportDir, textureName, ".dds", exportedNames );
-						if ( QFile::copy( foundPath, exportPath ) ) {
-							exportedCount++;
+						QFileInfo foundInfo( foundPath );
+						QString extension = foundInfo.suffix();
+						if ( extension.isEmpty() )
+							extension = "dds";
+
+						if ( extension.compare( "nif", Qt::CaseInsensitive ) == 0
+							|| extension.compare( "texcache", Qt::CaseInsensitive ) == 0 )
+						{
+							QString exportPath = getUniquePath( exportDir, textureName, ".dds", exportedNames );
+							if ( exportPixelDataFromNifFile( foundPath, exportPath ) ) {
+								exportedCount++;
+							} else {
+								failedCount++;
+							}
 						} else {
-							failedCount++;
+							QString exportPath = getUniquePath( exportDir, textureName, "." + extension, exportedNames );
+							if ( QFile::copy( foundPath, exportPath ) ) {
+								exportedCount++;
+							} else {
+								failedCount++;
+							}
 						}
 					} else {
 						failedCount++;
