@@ -330,15 +330,17 @@ nvtristrip {
 }
 
 qhull {
-    !*msvc*:QMAKE_CFLAGS += -isystem ../nifskope/lib/qhull/src
-    !*msvc*:QMAKE_CXXFLAGS += -isystem ../nifskope/lib/qhull/src
-    else:INCLUDEPATH += lib/qhull/src
+    !*msvc*:QMAKE_CFLAGS += -isystem $$_PRO_FILE_PWD_/lib/qhull/src
+    !*msvc*:QMAKE_CXXFLAGS += -isystem $$_PRO_FILE_PWD_/lib/qhull/src
+    else:INCLUDEPATH += $$_PRO_FILE_PWD_/lib/qhull/src
     HEADERS += $$files($$PWD/lib/qhull/src/libqhull/*.h, false)
 }
 
 gli {
-    !*msvc*:QMAKE_CXXFLAGS += -isystem ../nifskope/lib/gli/gli -isystem ../nifskope/lib/gli/external
-    else:INCLUDEPATH += lib/gli/gli lib/gli/external
+    !*msvc*:QMAKE_CXXFLAGS += -isystem $$_PRO_FILE_PWD_/lib/gli -isystem $$_PRO_FILE_PWD_/lib/gli/external
+    else:INCLUDEPATH += $$_PRO_FILE_PWD_/lib/gli $$_PRO_FILE_PWD_/lib/gli/external
+    # Fix for MinGW __cpuidex conflict with GLM - disable SIMD optimizations
+    *mingw*:DEFINES += GLM_FORCE_PURE
     HEADERS += $$files($$PWD/lib/gli/gli/*.hpp, true)
     HEADERS += $$files($$PWD/lib/gli/gli/*.inl, true)
     HEADERS += $$files($$PWD/lib/gli/external/glm/*.hpp, true)
@@ -346,9 +348,9 @@ gli {
 }
 
 zlib {
-    !*msvc*:QMAKE_CFLAGS += -isystem ../nifskope/lib/zlib
-    !*msvc*:QMAKE_CXXFLAGS += -isystem ../nifskope/lib/zlib
-    else:INCLUDEPATH += lib/zlib
+    !*msvc*:QMAKE_CFLAGS += -isystem $$_PRO_FILE_PWD_/lib/zlib
+    !*msvc*:QMAKE_CXXFLAGS += -isystem $$_PRO_FILE_PWD_/lib/zlib
+    else:INCLUDEPATH += $$_PRO_FILE_PWD_/lib/zlib
     HEADERS += $$files($$PWD/lib/zlib/*.h, false)
     SOURCES += $$files($$PWD/lib/zlib/*.c, false)
 }
@@ -504,20 +506,12 @@ win32:contains(QT_ARCH, i386) {
 	copyFiles( $$READMES,,,, md:txt )
 
 	win32:!static {
-		# Copy DLLs to build dir
-		copyFiles( $$QtBins(),, true )
+		# Copy GCC DLLs to build dir
+		*-g++:copyFiles( $$[QT_INSTALL_BINS]/lib*-*.dll,, true )
 
-		platforms += \
-			$$[QT_INSTALL_PLUGINS]/platforms/qminimal$${DLLEXT} \
-			$$[QT_INSTALL_PLUGINS]/platforms/qwindows$${DLLEXT}
-		
-		imageformats += \
-			$$[QT_INSTALL_PLUGINS]/imageformats/qjpeg$${DLLEXT} \
-			$$[QT_INSTALL_PLUGINS]/imageformats/qtga$${DLLEXT} \
-			$$[QT_INSTALL_PLUGINS]/imageformats/qwebp$${DLLEXT}
-
-		copyFiles( $$platforms, platforms, true )
-		copyFiles( $$imageformats, imageformats, true )
+		# Use windeployqt to copy Qt DLLs and plugins
+		#	Note: windeployqt is much more reliable than manual copying
+		QMAKE_POST_LINK += $$quote($$[QT_INSTALL_BINS]/windeployqt.exe) --no-compiler-runtime --no-translations --no-opengl-sw --no-system-d3d-compiler $$shell_path($$DESTDIR_TARGET) $$nt
 	}
 
 } # end build_pass

@@ -37,7 +37,7 @@ THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma warning(push, 0)
 #endif
 
-#include <gli.hpp>
+#include <gli/gli.hpp>
 
 #ifdef _MSC_VER
 #pragma warning(pop)

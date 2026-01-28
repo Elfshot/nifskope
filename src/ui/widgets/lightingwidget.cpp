@@ -1,6 +1,8 @@
 #include "lightingwidget.h"
 #include "ui_lightingwidget.h"
 
+#include <QAction>
+
 #include "glview.h"
 
 
